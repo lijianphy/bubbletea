@@ -258,6 +258,10 @@ func (s *cursedRenderer) flush(closing bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	return s.flushLocked(closing, s.w, true)
+}
+
+func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchronizedOutput bool) error {
 	view := s.view
 	frameArea := uv.Rect(0, 0, s.width, s.height)
 	if len(view.Content) == 0 {
@@ -528,7 +532,9 @@ func (s *cursedRenderer) flush(closing bool) error {
 	if s.syncdUpdates {
 		if hasUpdates {
 			// We have synchronized output updates enabled.
-			buf.WriteString(ansi.SetModeSynchronizedOutput)
+			if wrapSynchronizedOutput {
+				buf.WriteString(ansi.SetModeSynchronizedOutput)
+			}
 		}
 		if shouldUpdateCursorVis && hideCursor {
 			// Do we need to update the cursor visibility to hidden? If so, do
@@ -551,7 +557,9 @@ func (s *cursedRenderer) flush(closing bool) error {
 		}
 		if hasUpdates {
 			// Close synchronized output mode.
-			buf.WriteString(ansi.ResetModeSynchronizedOutput)
+			if wrapSynchronizedOutput {
+				buf.WriteString(ansi.ResetModeSynchronizedOutput)
+			}
 		}
 	} else if (shouldUpdateCursorVis && showCursor) || (hasUpdates && showCursor && didShowCursor) {
 		_, _ = buf.WriteString(ansi.SetModeTextCursorEnable)
@@ -565,7 +573,7 @@ func (s *cursedRenderer) flush(closing bool) error {
 		if s.logger != nil {
 			s.logger.Printf("output: %q", buf.String())
 		}
-		if _, err := io.Copy(s.w, &buf); err != nil {
+		if _, err := io.Copy(output, &buf); err != nil {
 			return fmt.Errorf("bubbletea: error flushing update to the writer: %w", err)
 		}
 	}
@@ -708,6 +716,50 @@ func (s *cursedRenderer) insertAbove(str string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	return s.insertAboveLocked(str, s.w)
+}
+
+// insertAboveAfterRender implements renderer.
+func (s *cursedRenderer) insertAboveAfterRender(str string) error {
+	if len(str) == 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.view.AltScreen {
+		return nil
+	}
+
+	var buf bytes.Buffer
+	wrapSynchronizedOutput := s.syncdUpdates
+	if err := s.flushLocked(false, &buf, !wrapSynchronizedOutput); err != nil {
+		return err
+	}
+	if err := s.insertAboveLocked(str, &buf); err != nil {
+		return err
+	}
+	if buf.Len() == 0 {
+		return nil
+	}
+	if wrapSynchronizedOutput {
+		var synchronized bytes.Buffer
+		synchronized.WriteString(ansi.SetModeSynchronizedOutput)
+		synchronized.Write(buf.Bytes())
+		synchronized.WriteString(ansi.ResetModeSynchronizedOutput)
+		if _, err := io.Copy(s.w, &synchronized); err != nil {
+			return fmt.Errorf("bubbletea: error flushing rendered insert above to the writer: %w", err)
+		}
+		return nil
+	}
+	if _, err := io.Copy(s.w, &buf); err != nil {
+		return fmt.Errorf("bubbletea: error flushing rendered insert above to the writer: %w", err)
+	}
+	return nil
+}
+
+func (s *cursedRenderer) insertAboveLocked(str string, output io.Writer) error {
 	if len(str) == 0 {
 		return nil
 	}
@@ -754,7 +806,7 @@ func (s *cursedRenderer) insertAbove(str string) error {
 		s.logger.Printf("insert above: %q", sb.String())
 	}
 
-	_, err := io.WriteString(s.w, sb.String())
+	_, err := io.WriteString(output, sb.String())
 	if err != nil {
 		return fmt.Errorf("bubbletea: error writing insert above to the writer: %w", err)
 	}

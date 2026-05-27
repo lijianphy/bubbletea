@@ -34,6 +34,10 @@ type renderer interface {
 	// insertAbove inserts unmanaged lines above the renderer.
 	insertAbove(string) error
 
+	// insertAboveAfterRender flushes the pending frame, then inserts unmanaged
+	// lines above the renderer.
+	insertAboveAfterRender(string) error
+
 	// setSyncdUpdates sets whether to use synchronized updates.
 	setSyncdUpdates(bool)
 
@@ -60,6 +64,10 @@ type printLineMessage struct {
 	messageBody string
 }
 
+type printLineAfterRenderMessage struct {
+	messageBody string
+}
+
 // Println prints above the Program. This output is unmanaged by the program and
 // will persist across renders by the Program.
 //
@@ -70,6 +78,22 @@ type printLineMessage struct {
 func Println(args ...any) Cmd {
 	return func() Msg {
 		return printLineMessage{
+			messageBody: fmt.Sprint(args...),
+		}
+	}
+}
+
+// PrintlnAfterRender prints above the Program after flushing the pending
+// renderer frame. This output is unmanaged by the program and will persist
+// across renders by the Program.
+//
+// Unlike fmt.Println (but similar to log.Println) the message will be print on
+// its own line.
+//
+// If the altscreen is active no output will be printed.
+func PrintlnAfterRender(args ...any) Cmd {
+	return func() Msg {
+		return printLineAfterRenderMessage{
 			messageBody: fmt.Sprint(args...),
 		}
 	}
@@ -86,6 +110,23 @@ func Println(args ...any) Cmd {
 func Printf(template string, args ...any) Cmd {
 	return func() Msg {
 		return printLineMessage{
+			messageBody: fmt.Sprintf(template, args...),
+		}
+	}
+}
+
+// PrintfAfterRender prints above the Program after flushing the pending
+// renderer frame. It takes a format template followed by values similar to
+// fmt.Printf. This output is unmanaged by the program and will persist across
+// renders by the Program.
+//
+// Unlike fmt.Printf (but similar to log.Printf) the message will be print on
+// its own line.
+//
+// If the altscreen is active no output will be printed.
+func PrintfAfterRender(template string, args ...any) Cmd {
+	return func() Msg {
+		return printLineAfterRenderMessage{
 			messageBody: fmt.Sprintf(template, args...),
 		}
 	}

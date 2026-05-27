@@ -1,10 +1,14 @@
 package tea
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 type mouseRaceModel struct {
@@ -76,5 +80,94 @@ func TestCursedRenderer_mouseVsFlush(t *testing.T) {
 	case <-runDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("program did not exit after Quit")
+	}
+}
+
+func TestCursedRenderer_insertAboveAfterRenderFlushesPendingFrame(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 40, 10)
+	renderer.render(NewView("old"))
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush old frame: %v", err)
+	}
+
+	out.Reset()
+	renderer.render(NewView("new"))
+	if err := renderer.insertAboveAfterRender("committed scrollback"); err != nil {
+		t.Fatalf("insert above after render: %v", err)
+	}
+
+	raw := out.String()
+	frameIndex := strings.Index(raw, "new")
+	scrollbackIndex := strings.Index(raw, "committed scrollback")
+	if frameIndex < 0 {
+		t.Fatalf("output missing pending frame flush: %q", raw)
+	}
+	if scrollbackIndex < 0 {
+		t.Fatalf("output missing inserted scrollback: %q", raw)
+	}
+	if frameIndex > scrollbackIndex {
+		t.Fatalf("output inserted scrollback before pending frame flush: %q", raw)
+	}
+}
+
+func TestCursedRenderer_insertAboveAfterRenderSuppressesAltScreenOutput(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 40, 10)
+	renderer.render(NewView("old"))
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush old frame: %v", err)
+	}
+
+	out.Reset()
+	view := NewView("altscreen frame")
+	view.AltScreen = true
+	renderer.render(view)
+	if err := renderer.insertAboveAfterRender("committed scrollback"); err != nil {
+		t.Fatalf("insert above after render: %v", err)
+	}
+
+	if raw := out.String(); raw != "" {
+		t.Fatalf("altscreen after-render print wrote output: %q", raw)
+	}
+}
+
+func TestCursedRenderer_insertAboveAfterRenderUsesOneSynchronizedOutputBlock(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 40, 10)
+	renderer.syncdUpdates = true
+	renderer.render(NewView("old"))
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush old frame: %v", err)
+	}
+
+	out.Reset()
+	renderer.render(NewView("new"))
+	if err := renderer.insertAboveAfterRender("committed scrollback"); err != nil {
+		t.Fatalf("insert above after render: %v", err)
+	}
+
+	raw := out.String()
+	startIndex := strings.Index(raw, ansi.SetModeSynchronizedOutput)
+	resetIndex := strings.LastIndex(raw, ansi.ResetModeSynchronizedOutput)
+	frameIndex := strings.Index(raw, "new")
+	scrollbackIndex := strings.Index(raw, "committed scrollback")
+	if startIndex < 0 || resetIndex < 0 {
+		t.Fatalf("output missing synchronized output wrapper: %q", raw)
+	}
+	if frameIndex < 0 || scrollbackIndex < 0 {
+		t.Fatalf("output missing frame or scrollback: %q", raw)
+	}
+	if startIndex > frameIndex || resetIndex < scrollbackIndex {
+		t.Fatalf("synchronized output wrapper does not enclose frame and scrollback: %q", raw)
+	}
+	if earlyReset := strings.Index(raw[:scrollbackIndex], ansi.ResetModeSynchronizedOutput); earlyReset >= 0 {
+		t.Fatalf("synchronized output closed before scrollback insertion: %q", raw)
 	}
 }
