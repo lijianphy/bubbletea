@@ -171,3 +171,21 @@ func TestCursedRenderer_insertAboveAfterRenderUsesOneSynchronizedOutputBlock(t *
 		t.Fatalf("synchronized output closed before scrollback insertion: %q", raw)
 	}
 }
+
+func TestCursedRenderer_insertAboveDoesNotEraseFullWidthLines(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 4, 4)
+	if err := renderer.insertAbove("abcd\nabc"); err != nil {
+		t.Fatalf("insert above: %v", err)
+	}
+
+	raw := out.String()
+	if strings.Contains(raw, "abcd"+ansi.EraseLineRight) {
+		t.Fatalf("full-width inserted line was erased on the right edge: %q", raw)
+	}
+	if !strings.Contains(raw, "abc"+ansi.EraseLineRight) {
+		t.Fatalf("short inserted line was not cleared to the right edge: %q", raw)
+	}
+}

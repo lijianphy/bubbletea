@@ -795,8 +795,11 @@ func (s *cursedRenderer) insertAboveLocked(str string, output io.Writer) error {
 	sb.WriteString(ansi.CursorUp(up))
 	sb.WriteString(ansi.InsertLine(offset))
 	for _, line := range lines {
+		lineWidth := ansi.StringWidth(line)
 		sb.WriteString(line)
-		sb.WriteString(ansi.EraseLineRight)
+		if w <= 0 || lineWidth < w {
+			sb.WriteString(ansi.EraseLineRight)
+		}
 		sb.WriteString("\r\n")
 	}
 
