@@ -530,11 +530,9 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	}
 
 	if s.syncdUpdates {
-		if hasUpdates {
+		if hasUpdates && wrapSynchronizedOutput {
 			// We have synchronized output updates enabled.
-			if wrapSynchronizedOutput {
-				buf.WriteString(ansi.SetModeSynchronizedOutput)
-			}
+			buf.WriteString(ansi.SetModeSynchronizedOutput)
 		}
 		if shouldUpdateCursorVis && hideCursor {
 			// Do we need to update the cursor visibility to hidden? If so, do
@@ -555,11 +553,9 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 			// it here after writing any updates to the buffer.
 			_, _ = buf.WriteString(ansi.SetModeTextCursorEnable)
 		}
-		if hasUpdates {
+		if hasUpdates && wrapSynchronizedOutput {
 			// Close synchronized output mode.
-			if wrapSynchronizedOutput {
-				buf.WriteString(ansi.ResetModeSynchronizedOutput)
-			}
+			buf.WriteString(ansi.ResetModeSynchronizedOutput)
 		}
 	} else if (shouldUpdateCursorVis && showCursor) || (hasUpdates && showCursor && didShowCursor) {
 		_, _ = buf.WriteString(ansi.SetModeTextCursorEnable)
@@ -764,6 +760,22 @@ func (s *cursedRenderer) insertAboveLocked(str string, output io.Writer) error {
 		return nil
 	}
 
+	// A single insert taller than the visible screen first scrolls blank rows
+	// into history. Insert bounded chunks so each scroll makes room for content.
+	for _, chunk := range insertAboveChunks(str, s.cellbuf.Width(), insertAboveChunkLimit(s.cellbuf.Height(), s.height)) {
+		if err := s.insertAboveChunkLocked(chunk, output); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *cursedRenderer) insertAboveChunkLocked(str string, output io.Writer) error {
+	if len(str) == 0 {
+		return nil
+	}
+
 	var sb strings.Builder
 	w, h := s.cellbuf.Width(), s.cellbuf.Height()
 	_, y := s.scr.Position()
@@ -815,6 +827,47 @@ func (s *cursedRenderer) insertAboveLocked(str string, output io.Writer) error {
 	}
 
 	return nil
+}
+
+func insertAboveChunks(str string, width int, maxRows int) []string {
+	if maxRows <= 0 {
+		return []string{str}
+	}
+	lines := insertAboveVisualLines(str, width)
+	chunks := make([]string, 0, (len(lines)/maxRows)+1)
+	for start := 0; start < len(lines); start += maxRows {
+		end := min(start+maxRows, len(lines))
+		chunks = append(chunks, strings.Join(lines[start:end], "\n"))
+	}
+	return chunks
+}
+
+func insertAboveVisualLines(str string, width int) []string {
+	lines := strings.Split(str, "\n")
+	if width <= 0 {
+		return lines
+	}
+	visual := make([]string, 0, len(lines))
+	for _, line := range lines {
+		wrapped := ansi.Hardwrap(line, width, true)
+		if wrapped == "" {
+			visual = append(visual, "")
+			continue
+		}
+		visual = append(visual, strings.Split(wrapped, "\n")...)
+	}
+	return visual
+}
+
+func insertAboveChunkLimit(frameHeight int, terminalHeight int) int {
+	limit := terminalHeight
+	if limit <= 0 || (frameHeight > 0 && frameHeight < limit) {
+		limit = frameHeight
+	}
+	if limit > 1 {
+		limit--
+	}
+	return max(1, limit)
 }
 
 // onMouse implements renderer.

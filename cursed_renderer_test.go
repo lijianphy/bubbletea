@@ -189,3 +189,46 @@ func TestCursedRenderer_insertAboveDoesNotEraseFullWidthLines(t *testing.T) {
 		t.Fatalf("short inserted line was not cleared to the right edge: %q", raw)
 	}
 }
+
+func TestCursedRenderer_insertAboveChunksPayloadTallerThanTerminal(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 20, 5)
+	lines := []string{
+		"line 00",
+		"line 01",
+		"line 02",
+		"line 03",
+		"line 04",
+		"line 05",
+		"line 06",
+		"line 07",
+		"line 08",
+		"line 09",
+		"line 10",
+		"line 11",
+	}
+	if err := renderer.insertAbove(strings.Join(lines, "\n") + "\n"); err != nil {
+		t.Fatalf("insert above: %v", err)
+	}
+
+	raw := out.String()
+	if strings.Contains(raw, strings.Repeat("\n", 5)) {
+		t.Fatalf("tall insert emitted a full-screen blank scroll before content: %q", raw)
+	}
+	if strings.Contains(raw, ansi.InsertLine(5)) || strings.Contains(raw, ansi.InsertLine(len(lines)+1)) {
+		t.Fatalf("tall insert used an unsafe insert-line count: %q", raw)
+	}
+	lastIndex := -1
+	for _, line := range lines {
+		index := strings.Index(raw, line)
+		if index < 0 {
+			t.Fatalf("tall insert missing %q in %q", line, raw)
+		}
+		if index < lastIndex {
+			t.Fatalf("tall insert reordered %q in %q", line, raw)
+		}
+		lastIndex = index
+	}
+}
