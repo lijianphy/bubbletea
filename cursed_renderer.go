@@ -860,14 +860,20 @@ func insertAboveVisualLines(str string, width int) []string {
 }
 
 func insertAboveChunkLimit(frameHeight int, terminalHeight int) int {
-	limit := terminalHeight
-	if limit <= 0 || (frameHeight > 0 && frameHeight < limit) {
-		limit = frameHeight
+	if terminalHeight > 0 {
+		if frameHeight > 0 {
+			return max(1, terminalHeight-frameHeight)
+		}
+		if terminalHeight > 1 {
+			return terminalHeight - 1
+		}
+		return 1
 	}
-	if limit > 1 {
-		limit--
+
+	if frameHeight > 1 {
+		return frameHeight - 1
 	}
-	return max(1, limit)
+	return 1
 }
 
 // onMouse implements renderer.

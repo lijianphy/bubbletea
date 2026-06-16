@@ -232,3 +232,115 @@ func TestCursedRenderer_insertAboveChunksPayloadTallerThanTerminal(t *testing.T)
 		lastIndex = index
 	}
 }
+
+func TestCursedRenderer_insertAboveUsesTerminalHeightForOneLineFrame(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 20, 5)
+	renderer.render(NewView("frame"))
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush frame: %v", err)
+	}
+
+	out.Reset()
+	if err := renderer.insertAbove("line 00\nline 01\nline 02\nline 03"); err != nil {
+		t.Fatalf("insert above: %v", err)
+	}
+
+	raw := out.String()
+	if !strings.Contains(raw, ansi.InsertLine(4)) {
+		t.Fatalf("one-line frame insert did not use terminal-height chunk: %q", raw)
+	}
+	if strings.Count(raw, ansi.InsertLine(1)) > 0 {
+		t.Fatalf("one-line frame insert was split into one-row chunks: %q", raw)
+	}
+}
+
+func TestCursedRenderer_insertAboveDoesNotUseRowsOccupiedByFrame(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 20, 5)
+	renderer.render(NewView("frame 1\nframe 2"))
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush frame: %v", err)
+	}
+
+	out.Reset()
+	if err := renderer.insertAbove("line 00\nline 01\nline 02\nline 03"); err != nil {
+		t.Fatalf("insert above: %v", err)
+	}
+
+	raw := out.String()
+	if strings.Contains(raw, ansi.InsertLine(4)) {
+		t.Fatalf("insert above used rows occupied by the frame: %q", raw)
+	}
+	if !strings.Contains(raw, ansi.InsertLine(3)) {
+		t.Fatalf("insert above did not use spare terminal rows: %q", raw)
+	}
+}
+
+func TestInsertAboveChunkLimit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		frameHeight    int
+		terminalHeight int
+		want           int
+	}{
+		{
+			name:           "uses spare terminal rows above one-line frame",
+			frameHeight:    1,
+			terminalHeight: 5,
+			want:           4,
+		},
+		{
+			name:           "does not use rows occupied by multi-line frame",
+			frameHeight:    2,
+			terminalHeight: 5,
+			want:           3,
+		},
+		{
+			name:           "uses one-row chunks when frame fills terminal",
+			frameHeight:    5,
+			terminalHeight: 5,
+			want:           1,
+		},
+		{
+			name:           "uses one-row chunks when frame is taller than terminal",
+			frameHeight:    10,
+			terminalHeight: 5,
+			want:           1,
+		},
+		{
+			name:           "keeps full-screen safety margin without managed frame",
+			frameHeight:    0,
+			terminalHeight: 5,
+			want:           4,
+		},
+		{
+			name:           "falls back to frame height when terminal height is unknown",
+			frameHeight:    3,
+			terminalHeight: 0,
+			want:           2,
+		},
+		{
+			name:           "minimum is one",
+			frameHeight:    0,
+			terminalHeight: 0,
+			want:           1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := insertAboveChunkLimit(tt.frameHeight, tt.terminalHeight); got != tt.want {
+				t.Fatalf("insertAboveChunkLimit(%d, %d) = %d, want %d", tt.frameHeight, tt.terminalHeight, got, tt.want)
+			}
+		})
+	}
+}
