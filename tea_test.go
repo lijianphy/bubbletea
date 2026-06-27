@@ -153,11 +153,9 @@ func TestTeaWaitQuit(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 5 {
-		wg.Add(1)
-		go func() {
+		wg.Go(func() {
 			p.Wait()
-			wg.Done()
-		}()
+		})
 	}
 	close(waitStarted)
 	wg.Wait()
@@ -207,11 +205,9 @@ func TestTeaWaitKill(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 5 {
-		wg.Add(1)
-		go func() {
+		wg.Go(func() {
 			p.Wait()
-			wg.Done()
-		}()
+		})
 	}
 	close(waitStarted)
 	wg.Wait()

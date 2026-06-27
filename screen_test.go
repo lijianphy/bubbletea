@@ -21,7 +21,6 @@ type testViewOpts struct {
 func testViewOptsCmds(opts ...testViewOpts) []Cmd {
 	cmds := make([]Cmd, len(opts))
 	for i, o := range opts {
-		o := o
 		cmds[i] = func() Msg {
 			return o
 		}

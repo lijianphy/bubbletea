@@ -938,9 +938,7 @@ func (p *Program) execBatchMsg(msg BatchMsg) {
 		if cmd == nil {
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 
 			if !p.disableCatchPanics {
 				defer func() {
@@ -959,7 +957,7 @@ func (p *Program) execBatchMsg(msg BatchMsg) {
 			default:
 				p.Send(msg)
 			}
-		}()
+		})
 	}
 
 	wg.Wait() // wait for all commands from batch msg to finish
@@ -1274,7 +1272,7 @@ func (p *Program) shutdown(kill bool) {
 
 // recoverFromPanic recovers from a panic, prints the stack trace, and restores
 // the terminal to a usable state.
-func (p *Program) recoverFromPanic(r interface{}) {
+func (p *Program) recoverFromPanic(r any) {
 	select {
 	case p.errs <- ErrProgramPanic:
 	default:
@@ -1299,7 +1297,7 @@ func (p *Program) recoverFromPanic(r interface{}) {
 
 // recoverFromGoPanic recovers from a goroutine panic, prints a stack trace and
 // signals for the program to be killed and terminal restored to a usable state.
-func (p *Program) recoverFromGoPanic(r interface{}) {
+func (p *Program) recoverFromGoPanic(r any) {
 	select {
 	case p.errs <- ErrProgramPanic:
 	default:

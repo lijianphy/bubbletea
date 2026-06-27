@@ -44,8 +44,7 @@ func TestOptions(t *testing.T) {
 
 	t.Run("external context", func(t *testing.T) {
 		t.Parallel()
-		extCtx, extCancel := context.WithCancel(context.Background())
-		defer extCancel()
+		extCtx := t.Context()
 
 		p := NewProgram(nil, WithContext(extCtx))
 		if p.externalCtx != extCtx || p.externalCtx == context.Background() {
