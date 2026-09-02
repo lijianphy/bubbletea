@@ -34,6 +34,7 @@ type cursedRenderer struct {
 	syncdUpdates  bool // whether to use synchronized output mode for updates
 	starting      bool // indicates whether the renderer is starting after being stopped
 	pendingErase  bool // an scr.Erase() is pending and hasn't been drained by flush yet
+	pendingUpdate bool // non-frame renderer state changed and must be flushed
 	noInput       bool // whether input is disabled, in which case keyboard enhancement queries are pointless
 }
 
@@ -155,6 +156,9 @@ func (s *cursedRenderer) start() {
 	}
 	if s.lastView.ProgressBar != nil {
 		setProgressBar(s, s.lastView.ProgressBar)
+	}
+	if s.cellbuf.Method == ansi.GraphemeWidth {
+		_, _ = s.scr.WriteString(ansi.SetModeUnicodeCore)
 	}
 	if !s.noInput {
 		// Enable modifyOtherKeys and Kitty keyboard protocol.
@@ -321,7 +325,18 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 		_, _ = s.scr.WriteString(ansi.SetTabEvery8Columns)
 	}
 
-	if !s.starting && !closing && !s.pendingErase && s.lastView != nil && viewEquals(s.lastView, &view) && frameArea == s.cellbuf.Bounds() {
+	var resumeOutput bytes.Buffer
+	if s.starting && s.lastView != nil {
+		// Drain state restored by start before processing a possible screen
+		// transition. In particular, Kitty keyboard stacks are screen-local.
+		if err := s.scr.Flush(); err != nil {
+			return fmt.Errorf("bubbletea: error flushing restored renderer state: %w", err)
+		}
+		resumeOutput.Write(s.buf.Bytes())
+		s.buf.Reset()
+	}
+
+	if !s.starting && !closing && !s.pendingErase && !s.pendingUpdate && s.lastView != nil && viewEquals(s.lastView, &view) && frameArea == s.cellbuf.Bounds() {
 		// No changes, nothing to do.
 		return nil
 	}
@@ -329,8 +344,12 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	// We're no longer starting.
 	s.starting = false
 	s.pendingErase = false
+	s.pendingUpdate = false
 
 	if frameArea != s.cellbuf.Bounds() {
+		if s.lastView != nil && !view.AltScreen && frameArea.Dy() < s.cellbuf.Height() {
+			s.deleteInlineFrame(s.cellbuf.Height())
+		}
 		s.scr.Erase() // Force a full redraw to avoid artifacts.
 
 		// We need to reset the touched lines buffer to match the new height.
@@ -563,6 +582,7 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	//    of showing the cursor flying around the screen during updates.
 
 	var buf bytes.Buffer
+	buf.Write(resumeOutput.Bytes())
 	if shouldUpdateAltScreen {
 		// We always reset keyboard enhancements when switching screens
 		// because the terminal is expected to have two different keyboard
@@ -627,6 +647,16 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	return nil
 }
 
+// deleteInlineFrame removes managed rows without scrolling them into history.
+// Some terminals preserve erased rows when an inline frame contracts.
+func (s *cursedRenderer) deleteInlineFrame(rows int) {
+	if rows <= 0 {
+		return
+	}
+	s.scr.MoveTo(0, 0)
+	_, _ = s.scr.WriteString(ansi.DeleteLine(rows))
+}
+
 // render implements renderer.
 func (s *cursedRenderer) render(v View) {
 	s.mu.Lock()
@@ -656,6 +686,8 @@ func reset(s *cursedRenderer) {
 	scr.SetBackspace(s.backspace)
 	scr.SetMapNewline(s.mapnl)
 	scr.SetScrollOptim(runtime.GOOS != "windows") // disable scroll optimization on Windows due to bugs in some terminals
+	scr.SetGraphemeWidth(s.cellbuf.Method == ansi.GraphemeWidth)
+	scr.SetWidthMethod(s.cellbuf.Method)
 	s.scr = scr
 }
 
@@ -676,10 +708,13 @@ func (s *cursedRenderer) resize(w, h int) {
 	// width hasn't changed in inline mode. On the other hand, when using
 	// alt screen mode, we always want to redraw because some terminals
 	// would scroll the screen and our content would be lost.
-	s.scr.Erase()
+	shouldErase := w != s.width || (s.lastView != nil && s.lastView.AltScreen)
+	if shouldErase {
+		s.scr.Erase()
+		s.pendingErase = true
+	}
 	s.width, s.height = w, h
 	s.scr.Resize(s.width, s.height)
-	s.pendingErase = true
 	s.mu.Unlock()
 }
 
@@ -754,6 +789,9 @@ func (s *cursedRenderer) setWidthMethod(method ansi.Method) {
 		_, _ = s.scr.WriteString(ansi.ResetModeUnicodeCore)
 	}
 	s.cellbuf.Method = method
+	s.scr.SetGraphemeWidth(method == ansi.GraphemeWidth)
+	s.scr.SetWidthMethod(method)
+	s.pendingUpdate = true
 	s.mu.Unlock()
 }
 

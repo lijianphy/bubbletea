@@ -172,6 +172,76 @@ func TestCursedRenderer_insertAboveAfterRenderUsesOneSynchronizedOutputBlock(t *
 	}
 }
 
+func TestCursedRendererInlineShrinkDeletesOldFrame(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 40, 10)
+	renderer.render(NewView("old 0\nold 1\nold 2\nold 3\nold 4\nold 5\nold 6"))
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush old frame: %v", err)
+	}
+	if strings.Contains(out.String(), ansi.DeleteLine(7)) {
+		t.Fatal("initial inline frame deleted preexisting rows")
+	}
+
+	out.Reset()
+	renderer.render(NewView("new 0\nnew 1"))
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush shrunken frame: %v", err)
+	}
+
+	raw := out.String()
+	if !strings.Contains(raw, ansi.DeleteLine(7)) {
+		t.Fatalf("inline shrink did not delete its 7-row old frame: %q", raw)
+	}
+}
+
+func TestCursedRendererInlineHeightResizeDoesNotRedraw(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 40, 10)
+	view := NewView("frame 0\nframe 1\nframe 2")
+	renderer.render(view)
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush initial frame: %v", err)
+	}
+
+	out.Reset()
+	renderer.resize(40, 12)
+	renderer.render(view)
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush height-only resize: %v", err)
+	}
+	if raw := out.String(); raw != "" {
+		t.Fatalf("inline height-only resize redrew an unchanged frame: %q", raw)
+	}
+}
+
+func TestCursedRendererPendingEraseRedrawsUnchangedFrame(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 40, 10)
+	view := NewView("frame")
+	renderer.render(view)
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush initial frame: %v", err)
+	}
+
+	out.Reset()
+	renderer.clearScreen()
+	renderer.render(view)
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush cleared frame: %v", err)
+	}
+	raw := out.String()
+	if !strings.Contains(raw, ansi.EraseScreenBelow) || !strings.Contains(raw, "frame") {
+		t.Fatalf("pending erase did not redraw unchanged frame: %q", raw)
+	}
+}
+
 func TestCursedRenderer_insertAboveDoesNotEraseFullWidthLines(t *testing.T) {
 	t.Parallel()
 
@@ -409,17 +479,55 @@ func TestCursedRenderer_restoresKittyKeyboardStack(t *testing.T) {
 	if n := strings.Count(got, pop); n != 4 {
 		t.Fatalf("expected kitty keyboard protocol to be popped 4 times with %q (%d times), got %q", pop, n, got)
 	}
-	// Every pop must come after a push: the stack is balanced when pushes
-	// and pops alternate. The resumed flush pushes twice in a row (once in
-	// start(), once in flush()), and both entries are popped afterwards.
+	// Every screen activation pushes exactly once before that screen is popped.
 	assertInOrder(t, got,
-		pushMain, pop, // close pops the entry pushed by the first flush
-		pop,           // entering the alt screen pops the resumed entry
-		pushMain, pop, // leaving the alt screen
-		pushMain, pop, // the resumed main screen entry and the final close
+		pushMain, pop, // initial main screen
+		pushMain, pop, // resumed main screen
+		pushMain, pop, // alt screen
+		pushMain, pop, // main screen after leaving alt
 	)
 	if strings.Contains(got, ansi.KittyKeyboard(0, 1)) {
 		t.Fatalf("expected kitty keyboard protocol not to be reset in-place with %q, got %q", ansi.KittyKeyboard(0, 1), got)
+	}
+}
+
+func TestCursedRenderer_restoresKeyboardStackBeforeScreenSwitch(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 80, 24)
+	renderer.start()
+
+	view := NewView("hello")
+	view.KeyboardEnhancements.ReportEventTypes = true
+	renderer.render(view)
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush initial frame: %v", err)
+	}
+	if err := renderer.close(); err != nil {
+		t.Fatalf("close renderer: %v", err)
+	}
+
+	out.Reset()
+	renderer.start()
+	view.AltScreen = true
+	renderer.render(view)
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush alt-screen frame after restart: %v", err)
+	}
+
+	push := ansi.PushKittyKeyboard(keyboardEnhancementsFlags(view.KeyboardEnhancements))
+	pop := ansi.PopKittyKeyboard(1)
+	enterAlt := ansi.SetModeAltScreenSaveCursor
+	raw := out.String()
+	assertInOrder(t, raw, push, pop, enterAlt, push)
+
+	enterAltIndex := strings.Index(raw, enterAlt)
+	if got := strings.Count(raw[:enterAltIndex], push); got != 1 {
+		t.Fatalf("main screen received %d restored keyboard pushes, want 1: %q", got, raw)
+	}
+	if got := strings.Count(raw[enterAltIndex+len(enterAlt):], push); got != 1 {
+		t.Fatalf("alt screen received %d keyboard pushes, want 1: %q", got, raw)
 	}
 }
 
@@ -460,5 +568,45 @@ func TestCursedRenderer_updatesKittyKeyboardFlagsInPlace(t *testing.T) {
 	}
 	if n := strings.Count(got, ansi.PushKittyKeyboard(0)); n > 1 {
 		t.Fatalf("expected kitty keyboard protocol to be pushed once, got %d pushes in %q", n, got)
+	}
+}
+
+func TestCursedRenderer_restoresGraphemeWidthAfterRestart(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 40, 10)
+	view := NewView("hello")
+	renderer.render(view)
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush initial frame: %v", err)
+	}
+
+	out.Reset()
+	renderer.setWidthMethod(ansi.GraphemeWidth)
+	renderer.render(view)
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush grapheme-width update: %v", err)
+	}
+	if raw := out.String(); !strings.Contains(raw, ansi.SetModeUnicodeCore) {
+		t.Fatalf("unchanged frame did not flush Unicode core mode: %q", raw)
+	}
+
+	out.Reset()
+	if err := renderer.close(); err != nil {
+		t.Fatalf("close renderer: %v", err)
+	}
+	if raw := out.String(); !strings.Contains(raw, ansi.ResetModeUnicodeCore) {
+		t.Fatalf("close did not reset Unicode core mode: %q", raw)
+	}
+
+	out.Reset()
+	renderer.start()
+	renderer.render(view)
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush restarted renderer: %v", err)
+	}
+	if raw := out.String(); !strings.Contains(raw, ansi.SetModeUnicodeCore) {
+		t.Fatalf("restart did not restore Unicode core mode: %q", raw)
 	}
 }
