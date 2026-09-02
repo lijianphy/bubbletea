@@ -947,7 +947,6 @@ func (p *Program) execBatchMsg(msg BatchMsg) {
 			continue
 		}
 		wg.Go(func() {
-
 			if !p.disableCatchPanics {
 				defer func() {
 					if r := recover(); r != nil {
