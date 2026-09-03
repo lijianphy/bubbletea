@@ -197,6 +197,90 @@ func TestCursedRendererInlineShrinkDeletesOldFrame(t *testing.T) {
 	}
 }
 
+func TestCursedRendererAltToInlineDoesNotDeleteMainScreenRows(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 40, 10)
+	altView := NewView("alt")
+	altView.AltScreen = true
+	renderer.render(altView)
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush alt-screen frame: %v", err)
+	}
+
+	out.Reset()
+	renderer.render(NewView("inline"))
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush inline frame: %v", err)
+	}
+	if raw := out.String(); strings.Contains(raw, ansi.DeleteLine(10)) {
+		t.Fatalf("alt-to-inline transition deleted main-screen rows: %q", raw)
+	}
+}
+
+func TestCursedRendererRestartFromAltUsesMainScreenBaseline(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 40, 10)
+	renderer.start()
+	altView := NewView("alt")
+	altView.AltScreen = true
+	renderer.render(altView)
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush alt-screen frame: %v", err)
+	}
+	if err := renderer.close(); err != nil {
+		t.Fatalf("close renderer: %v", err)
+	}
+
+	out.Reset()
+	renderer.start()
+	renderer.render(NewView("inline"))
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush restarted inline frame: %v", err)
+	}
+	raw := out.String()
+	if strings.Contains(raw, ansi.ResetModeAltScreenSaveCursor) {
+		t.Fatalf("restart exited an alt screen that close had already exited: %q", raw)
+	}
+	if strings.Contains(raw, ansi.DeleteLine(10)) {
+		t.Fatalf("restart from alt deleted main-screen rows: %q", raw)
+	}
+}
+
+func TestCursedRendererCloseBeforeRestartFlushDoesNotTeardownState(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 40, 10)
+	renderer.start()
+	view := NewView("alt")
+	view.AltScreen = true
+	renderer.render(view)
+	if err := renderer.flush(false); err != nil {
+		t.Fatalf("flush alt-screen frame: %v", err)
+	}
+	if err := renderer.close(); err != nil {
+		t.Fatalf("close renderer: %v", err)
+	}
+
+	out.Reset()
+	renderer.start()
+	if err := renderer.close(); err != nil {
+		t.Fatalf("close restarted renderer before flush: %v", err)
+	}
+
+	raw := out.String()
+	if strings.Contains(raw, ansi.PopKittyKeyboard(1)) {
+		t.Fatalf("close popped unapplied keyboard state: %q", raw)
+	}
+	if strings.Contains(raw, ansi.ResetModeAltScreenSaveCursor) {
+		t.Fatalf("close exited an alt screen that was not restored: %q", raw)
+	}
+}
+
 func TestCursedRendererInlineHeightResizeDoesNotRedraw(t *testing.T) {
 	t.Parallel()
 
@@ -449,16 +533,28 @@ func TestCursedRenderer_restoresKittyKeyboardStack(t *testing.T) {
 	render(view)
 
 	// Stop the renderer (as on suspend or ExecProcess) and start it again:
-	// close pops the stack entry, start pushes it back.
+	// close pops the stack entry, and the first resumed flush pushes the
+	// current screen's entry.
 	if err := r.close(); err != nil {
 		t.Fatal(err)
 	}
+	restartOffset := out.Len()
 	r.start()
 
 	// Enter and leave the alt screen. The terminal keeps a separate Kitty
 	// keyboard stack per screen, so each screen gets its own push and pop.
 	view.AltScreen = true
 	render(view)
+	restartOutput := out.String()[restartOffset:]
+	enterAlt := ansi.SetModeAltScreenSaveCursor
+	assertInOrder(t, restartOutput, enterAlt, pushMain)
+	if strings.Contains(restartOutput[:strings.Index(restartOutput, enterAlt)], pushMain) {
+		t.Fatalf("restart restored an obsolete main-screen keyboard stack: %q", restartOutput)
+	}
+	if strings.Contains(restartOutput, pop) {
+		t.Fatalf("restart popped a keyboard stack that close had already restored: %q", restartOutput)
+	}
+
 	view.AltScreen = false
 	render(view)
 
@@ -467,22 +563,18 @@ func TestCursedRenderer_restoresKittyKeyboardStack(t *testing.T) {
 	}
 
 	got := out.String()
-	// The flags are pushed once per screen activation: the first flush,
-	// the flush after the renderer was restarted, and on each screen
-	// switch. start() itself does not write to [out].
-	if n := strings.Count(got, pushMain); n != 4 {
-		t.Fatalf("expected kitty keyboard protocol to be pushed 4 times with %q (%d times), got %q", pushMain, n, got)
+	// The flags are pushed once for each screen actually activated: the
+	// initial main screen, the alt screen selected before the restarted
+	// renderer flushes, and the main screen after leaving alt.
+	if n := strings.Count(got, pushMain); n != 3 {
+		t.Fatalf("expected kitty keyboard protocol to be pushed 3 times with %q (%d times), got %q", pushMain, n, got)
 	}
-	// One pop per stop/start cycle and per screen switch: closing pops the
-	// current screen's entry, and switching screens pops the entry of the
-	// screen being left.
-	if n := strings.Count(got, pop); n != 4 {
-		t.Fatalf("expected kitty keyboard protocol to be popped 4 times with %q (%d times), got %q", pop, n, got)
+	if n := strings.Count(got, pop); n != 3 {
+		t.Fatalf("expected kitty keyboard protocol to be popped 3 times with %q (%d times), got %q", pop, n, got)
 	}
 	// Every screen activation pushes exactly once before that screen is popped.
 	assertInOrder(t, got,
 		pushMain, pop, // initial main screen
-		pushMain, pop, // resumed main screen
 		pushMain, pop, // alt screen
 		pushMain, pop, // main screen after leaving alt
 	)
@@ -491,7 +583,7 @@ func TestCursedRenderer_restoresKittyKeyboardStack(t *testing.T) {
 	}
 }
 
-func TestCursedRenderer_restoresKeyboardStackBeforeScreenSwitch(t *testing.T) {
+func TestCursedRendererRestartReappliesCurrentViewModes(t *testing.T) {
 	t.Parallel()
 
 	var out bytes.Buffer
@@ -499,7 +591,11 @@ func TestCursedRenderer_restoresKeyboardStackBeforeScreenSwitch(t *testing.T) {
 	renderer.start()
 
 	view := NewView("hello")
-	view.KeyboardEnhancements.ReportEventTypes = true
+	view.Cursor = NewCursor(0, 0)
+	view.ReportFocus = true
+	view.MouseMode = MouseModeAllMotion
+	view.WindowTitle = "restored"
+	view.ProgressBar = &ProgressBar{State: ProgressBarIndeterminate}
 	renderer.render(view)
 	if err := renderer.flush(false); err != nil {
 		t.Fatalf("flush initial frame: %v", err)
@@ -510,24 +606,24 @@ func TestCursedRenderer_restoresKeyboardStackBeforeScreenSwitch(t *testing.T) {
 
 	out.Reset()
 	renderer.start()
-	view.AltScreen = true
 	renderer.render(view)
 	if err := renderer.flush(false); err != nil {
-		t.Fatalf("flush alt-screen frame after restart: %v", err)
+		t.Fatalf("flush restarted renderer: %v", err)
 	}
 
-	push := ansi.PushKittyKeyboard(keyboardEnhancementsFlags(view.KeyboardEnhancements))
-	pop := ansi.PopKittyKeyboard(1)
-	enterAlt := ansi.SetModeAltScreenSaveCursor
 	raw := out.String()
-	assertInOrder(t, raw, push, pop, enterAlt, push)
-
-	enterAltIndex := strings.Index(raw, enterAlt)
-	if got := strings.Count(raw[:enterAltIndex], push); got != 1 {
-		t.Fatalf("main screen received %d restored keyboard pushes, want 1: %q", got, raw)
-	}
-	if got := strings.Count(raw[enterAltIndex+len(enterAlt):], push); got != 1 {
-		t.Fatalf("alt screen received %d keyboard pushes, want 1: %q", got, raw)
+	for _, want := range []string{
+		ansi.SetModeBracketedPaste,
+		ansi.SetModeFocusEvent,
+		ansi.SetModeMouseAnyEvent,
+		ansi.SetModeMouseExtSgr,
+		ansi.SetWindowTitle(view.WindowTitle),
+		ansi.SetModeTextCursorEnable,
+		ansi.SetIndeterminateProgressBar,
+	} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("restarted renderer did not restore %q in %q", want, raw)
+		}
 	}
 }
 

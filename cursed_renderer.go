@@ -32,9 +32,8 @@ type cursedRenderer struct {
 	backspace     bool // whether to use backspace to optimize cursor movements
 	mapnl         bool
 	syncdUpdates  bool // whether to use synchronized output mode for updates
-	starting      bool // indicates whether the renderer is starting after being stopped
-	pendingErase  bool // an scr.Erase() is pending and hasn't been drained by flush yet
-	pendingUpdate bool // non-frame renderer state changed and must be flushed
+	needsRestore  bool // terminal is at baseline and the next flush must reapply view state
+	forceFlush    bool // renderer state changed and must bypass the unchanged-view fast path
 	noInput       bool // whether input is disabled, in which case keyboard enhancement queries are pointless
 }
 
@@ -67,16 +66,12 @@ func (s *cursedRenderer) setNoInput(noInput bool) {
 
 // resetKeyboardEnhancements writes the sequences that reset keyboard
 // enhancement protocols when switching between the main and alt screens.
-// modifyOtherKeys has no stack, so it is reset in place; the Kitty keyboard
-// stack is popped, but only if we previously pushed an entry (i.e. this is
-// not the first render). With input disabled the keyboard protocol is never
-// touched.
-func (s *cursedRenderer) resetKeyboardEnhancements(buf *bytes.Buffer) {
+func (s *cursedRenderer) resetKeyboardEnhancements(buf *bytes.Buffer, previousView *View) {
 	if s.noInput {
 		return
 	}
 	_, _ = buf.WriteString(ansi.ResetModifyOtherKeys)
-	if s.lastView != nil {
+	if previousView != nil {
 		_, _ = buf.WriteString(ansi.PopKittyKeyboard(1))
 	}
 }
@@ -100,76 +95,11 @@ func (s *cursedRenderer) setOptimizations(hardTabs, backspace, mapnl bool) {
 // start implements renderer.
 func (s *cursedRenderer) start() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Mark that we're starting. This is used to restore some state when
-	// starting the renderer again after it was stopped.
-	s.starting = true
-
-	if s.lastView == nil {
-		return
-	}
-
-	if s.lastView.AltScreen {
-		enableAltScreen(s, true, true)
-	}
-	enableTextCursor(s, s.lastView.Cursor != nil)
-	if s.lastView.Cursor != nil {
-		if s.lastView.Cursor.Color != nil {
-			col, ok := colorful.MakeColor(s.lastView.Cursor.Color)
-			if ok {
-				_, _ = s.scr.WriteString(ansi.SetCursorColor(col.Hex()))
-			}
-		}
-		curStyle := encodeCursorStyle(s.lastView.Cursor.Shape, s.lastView.Cursor.Blink)
-		if curStyle != 0 && curStyle != 1 {
-			_, _ = s.scr.WriteString(ansi.SetCursorStyle(curStyle))
-		}
-	}
-	if s.lastView.ForegroundColor != nil {
-		col, ok := colorful.MakeColor(s.lastView.ForegroundColor)
-		if ok {
-			_, _ = s.scr.WriteString(ansi.SetForegroundColor(col.Hex()))
-		}
-	}
-	if s.lastView.BackgroundColor != nil {
-		col, ok := colorful.MakeColor(s.lastView.BackgroundColor)
-		if ok {
-			_, _ = s.scr.WriteString(ansi.SetBackgroundColor(col.Hex()))
-		}
-	}
-	if !s.lastView.DisableBracketedPasteMode {
-		_, _ = s.scr.WriteString(ansi.SetModeBracketedPaste)
-	}
-	if s.lastView.ReportFocus {
-		_, _ = s.scr.WriteString(ansi.SetModeFocusEvent)
-	}
-	switch s.lastView.MouseMode {
-	case MouseModeNone:
-	case MouseModeCellMotion:
-		_, _ = s.scr.WriteString(ansi.SetModeMouseButtonEvent + ansi.SetModeMouseExtSgr)
-	case MouseModeAllMotion:
-		_, _ = s.scr.WriteString(ansi.SetModeMouseAnyEvent + ansi.SetModeMouseExtSgr)
-	}
-	if s.lastView.WindowTitle != "" {
-		_, _ = s.scr.WriteString(ansi.SetWindowTitle(s.lastView.WindowTitle))
-	}
-	if s.lastView.ProgressBar != nil {
-		setProgressBar(s, s.lastView.ProgressBar)
-	}
-	if s.cellbuf.Method == ansi.GraphemeWidth {
-		_, _ = s.scr.WriteString(ansi.SetModeUnicodeCore)
-	}
-	if !s.noInput {
-		// Enable modifyOtherKeys and Kitty keyboard protocol.
-		// Both can coexist; terminals ignore what they don't support.
-		_, _ = s.scr.WriteString(ansi.SetModifyOtherKeys2)
-
-		kittyFlags := keyboardEnhancementsFlags(s.lastView.KeyboardEnhancements)
-		// The entry was popped when the renderer was stopped, so push a fresh
-		// one for the screen we're about to restore.
-		_, _ = s.scr.WriteString(ansi.PushKittyKeyboard(kittyFlags))
-	}
+	// flushLocked restores the current view from the terminal baseline left by
+	// close. Deferring restoration keeps all terminal state transitions in one
+	// place and handles view changes that occur while the renderer is stopped.
+	s.needsRestore = true
+	s.mu.Unlock()
 }
 
 // close implements renderer.
@@ -181,7 +111,9 @@ func (s *cursedRenderer) close() (err error) {
 	// we don't change the [cursedRenderer] altScreen and cursorHidden states
 	// so that we can restore them when we start the renderer again. This is
 	// used when the user suspends the program and then resumes it.
-	if lv := s.lastView; lv != nil { //nolint:nestif
+	// If restoration is pending, lastView describes the previous active
+	// session, not state that is currently applied to the terminal.
+	if lv := s.lastView; lv != nil && !s.needsRestore { //nolint:nestif
 		// NOTE: The Kitty keyboard specs specify that the terminal should have
 		// two registries for the main and alt screens. We disable keyboard
 		// enhancements whenever we enter/exit alt screen mode in
@@ -278,6 +210,7 @@ func (s *cursedRenderer) close() (err error) {
 	// cursor position so that we can continue where we left off.
 	reset(s)
 	s.scr.SetPosition(x, y)
+	s.needsRestore = true
 
 	return nil
 }
@@ -321,33 +254,28 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	}
 
 	// Restore tab stops if we have tab optimizations enabled.
-	if s.starting && s.hardTabs {
+	if s.needsRestore && s.hardTabs {
 		_, _ = s.scr.WriteString(ansi.SetTabEvery8Columns)
 	}
 
-	var resumeOutput bytes.Buffer
-	if s.starting && s.lastView != nil {
-		// Drain state restored by start before processing a possible screen
-		// transition. In particular, Kitty keyboard stacks are screen-local.
-		if err := s.scr.Flush(); err != nil {
-			return fmt.Errorf("bubbletea: error flushing restored renderer state: %w", err)
+	previousView := s.lastView
+	if s.needsRestore {
+		// close restores a known terminal baseline. Reapply the current view
+		// from that baseline instead of restoring a potentially obsolete view.
+		previousView = nil
+		if s.cellbuf.Method == ansi.GraphemeWidth {
+			_, _ = s.scr.WriteString(ansi.SetModeUnicodeCore)
 		}
-		resumeOutput.Write(s.buf.Bytes())
-		s.buf.Reset()
 	}
 
-	if !s.starting && !closing && !s.pendingErase && !s.pendingUpdate && s.lastView != nil && viewEquals(s.lastView, &view) && frameArea == s.cellbuf.Bounds() {
+	if !s.needsRestore && !closing && !s.forceFlush && s.lastView != nil && viewEquals(s.lastView, &view) && frameArea == s.cellbuf.Bounds() {
 		// No changes, nothing to do.
 		return nil
 	}
 
-	// We're no longer starting.
-	s.starting = false
-	s.pendingErase = false
-	s.pendingUpdate = false
-
 	if frameArea != s.cellbuf.Bounds() {
-		if s.lastView != nil && !view.AltScreen && frameArea.Dy() < s.cellbuf.Height() {
+		if s.lastView != nil && !s.lastView.AltScreen && !view.AltScreen &&
+			frameArea.Dy() < s.cellbuf.Height() {
 			s.deleteInlineFrame(s.cellbuf.Height())
 		}
 		s.scr.Erase() // Force a full redraw to avoid artifacts.
@@ -374,7 +302,8 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	}
 
 	// Alt screen mode.
-	shouldUpdateAltScreen := (s.lastView == nil && view.AltScreen) || (s.lastView != nil && s.lastView.AltScreen != view.AltScreen)
+	shouldUpdateAltScreen := (previousView == nil && view.AltScreen) ||
+		(previousView != nil && previousView.AltScreen != view.AltScreen)
 	if shouldUpdateAltScreen {
 		// We want to enter/exit altscreen mode but defer writing the actual
 		// sequences until we flush the rest of the updates. This is because we
@@ -386,39 +315,39 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	}
 
 	// bracketed paste mode.
-	if s.lastView == nil || view.DisableBracketedPasteMode != s.lastView.DisableBracketedPasteMode {
+	if previousView == nil || view.DisableBracketedPasteMode != previousView.DisableBracketedPasteMode {
 		if !view.DisableBracketedPasteMode {
 			_, _ = s.scr.WriteString(ansi.SetModeBracketedPaste)
-		} else if s.lastView != nil {
+		} else if previousView != nil {
 			_, _ = s.scr.WriteString(ansi.ResetModeBracketedPaste)
 		}
 	}
 
 	// report focus events mode.
-	if s.lastView == nil || s.lastView.ReportFocus != view.ReportFocus {
+	if previousView == nil || previousView.ReportFocus != view.ReportFocus {
 		if view.ReportFocus {
 			_, _ = s.scr.WriteString(ansi.SetModeFocusEvent)
-		} else if s.lastView != nil {
+		} else if previousView != nil {
 			_, _ = s.scr.WriteString(ansi.ResetModeFocusEvent)
 		}
 	}
 
 	// mouse events mode.
-	if s.lastView == nil || view.MouseMode != s.lastView.MouseMode {
+	if previousView == nil || view.MouseMode != previousView.MouseMode {
 		switch view.MouseMode {
 		case MouseModeNone:
-			if s.lastView != nil && s.lastView.MouseMode != MouseModeNone {
+			if previousView != nil && previousView.MouseMode != MouseModeNone {
 				_, _ = s.scr.WriteString(ansi.ResetModeMouseButtonEvent +
 					ansi.ResetModeMouseAnyEvent +
 					ansi.ResetModeMouseExtSgr)
 			}
 		case MouseModeCellMotion:
-			if s.lastView != nil && s.lastView.MouseMode == MouseModeAllMotion {
+			if previousView != nil && previousView.MouseMode == MouseModeAllMotion {
 				_, _ = s.scr.WriteString(ansi.ResetModeMouseAnyEvent)
 			}
 			_, _ = s.scr.WriteString(ansi.SetModeMouseButtonEvent + ansi.SetModeMouseExtSgr)
 		case MouseModeAllMotion:
-			if s.lastView != nil && s.lastView.MouseMode == MouseModeCellMotion {
+			if previousView != nil && previousView.MouseMode == MouseModeCellMotion {
 				_, _ = s.scr.WriteString(ansi.ResetModeMouseButtonEvent)
 			}
 			_, _ = s.scr.WriteString(ansi.SetModeMouseAnyEvent + ansi.SetModeMouseExtSgr)
@@ -426,8 +355,8 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	}
 
 	// Set window title.
-	if s.lastView == nil || view.WindowTitle != s.lastView.WindowTitle {
-		if s.lastView != nil || view.WindowTitle != "" {
+	if previousView == nil || view.WindowTitle != previousView.WindowTitle {
+		if previousView != nil || view.WindowTitle != "" {
 			_, _ = s.scr.WriteString(ansi.SetWindowTitle(view.WindowTitle))
 		}
 	}
@@ -436,8 +365,8 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	// enhancements only affect keyboard input, and querying the terminal
 	// would leave its response unconsumed, leaking into the shell after
 	// the program exits.
-	if !s.noInput && (s.lastView == nil || view.KeyboardEnhancements != s.lastView.KeyboardEnhancements ||
-		view.AltScreen != s.lastView.AltScreen) {
+	if !s.noInput && (previousView == nil || view.KeyboardEnhancements != previousView.KeyboardEnhancements ||
+		view.AltScreen != previousView.AltScreen) {
 		// NOTE: We need to reset the keyboard protocol when switching
 		// between main and alt screen. This is because the specs specify
 		// two different states for the main and alt screen.
@@ -446,7 +375,7 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 		_, _ = s.scr.WriteString(ansi.SetModifyOtherKeys2)
 
 		kittyFlags := keyboardEnhancementsFlags(view.KeyboardEnhancements)
-		if s.lastView == nil || view.AltScreen != s.lastView.AltScreen {
+		if previousView == nil || view.AltScreen != previousView.AltScreen {
 			// First render or screen switch: the previous screen's entry
 			// (if any) is popped below, so push a fresh one for this
 			// screen.
@@ -473,12 +402,12 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	if view.Cursor != nil {
 		cc = view.Cursor.Color
 	}
-	if s.lastView != nil {
-		if s.lastView.Cursor != nil {
-			lcc = s.lastView.Cursor.Color
+	if previousView != nil {
+		if previousView.Cursor != nil {
+			lcc = previousView.Cursor.Color
 		}
-		lfg = s.lastView.ForegroundColor
-		lbg = s.lastView.BackgroundColor
+		lfg = previousView.ForegroundColor
+		lbg = previousView.BackgroundColor
 	}
 	for _, c := range []struct {
 		newColor color.Color
@@ -508,7 +437,7 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	var ccStyle, lcStyle int
 	var lcur *Cursor
 	ccur := view.Cursor
-	if lv := s.lastView; lv != nil {
+	if lv := previousView; lv != nil {
 		lcur = lv.Cursor
 	}
 	if ccur != nil {
@@ -522,9 +451,9 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	}
 
 	// Render progress bar if it's changed.
-	if (s.lastView == nil && view.ProgressBar != nil && view.ProgressBar.State != ProgressBarNone) ||
-		(s.lastView != nil && (s.lastView.ProgressBar == nil) != (view.ProgressBar == nil)) ||
-		(s.lastView != nil && s.lastView.ProgressBar != nil && view.ProgressBar != nil && *s.lastView.ProgressBar != *view.ProgressBar) {
+	if (previousView == nil && view.ProgressBar != nil && view.ProgressBar.State != ProgressBarNone) ||
+		(previousView != nil && (previousView.ProgressBar == nil) != (view.ProgressBar == nil)) ||
+		(previousView != nil && previousView.ProgressBar != nil && view.ProgressBar != nil && *previousView.ProgressBar != *view.ProgressBar) {
 		// Render or clear the progress bar if it was added or removed.
 		setProgressBar(s, view.ProgressBar)
 	}
@@ -557,10 +486,10 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	hasUpdates := s.buf.Len() > 0
 
 	// Cursor visibility.
-	didShowCursor := s.lastView != nil && s.lastView.Cursor != nil
+	didShowCursor := previousView != nil && previousView.Cursor != nil
 	showCursor := view.Cursor != nil
 	hideCursor := !showCursor
-	shouldUpdateCursorVis := (s.lastView == nil || didShowCursor != showCursor) || shouldUpdateAltScreen
+	shouldUpdateCursorVis := (previousView == nil || didShowCursor != showCursor) || shouldUpdateAltScreen
 
 	// Build final output buffer with synchronized output or hide/show cursor
 	// updates. But first, enter/exit alt screen mode if needed.
@@ -582,12 +511,11 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	//    of showing the cursor flying around the screen during updates.
 
 	var buf bytes.Buffer
-	buf.Write(resumeOutput.Bytes())
 	if shouldUpdateAltScreen {
 		// We always reset keyboard enhancements when switching screens
 		// because the terminal is expected to have two different keyboard
 		// registries for main and alt screens.
-		s.resetKeyboardEnhancements(&buf)
+		s.resetKeyboardEnhancements(&buf, previousView)
 		if view.AltScreen {
 			// Entering alt screen mode.
 			buf.WriteString(ansi.SetModeAltScreenSaveCursor)
@@ -643,6 +571,8 @@ func (s *cursedRenderer) flushLocked(closing bool, output io.Writer, wrapSynchro
 	}
 
 	s.lastView = &view
+	s.needsRestore = false
+	s.forceFlush = false
 
 	return nil
 }
@@ -711,7 +641,7 @@ func (s *cursedRenderer) resize(w, h int) {
 	shouldErase := w != s.width || (s.lastView != nil && s.lastView.AltScreen)
 	if shouldErase {
 		s.scr.Erase()
-		s.pendingErase = true
+		s.forceFlush = true
 	}
 	s.width, s.height = w, h
 	s.scr.Resize(s.width, s.height)
@@ -725,7 +655,7 @@ func (s *cursedRenderer) clearScreen() {
 	// screen redraw.
 	s.scr.MoveTo(0, 0)
 	s.scr.Erase()
-	s.pendingErase = true
+	s.forceFlush = true
 	s.mu.Unlock()
 }
 
@@ -791,7 +721,7 @@ func (s *cursedRenderer) setWidthMethod(method ansi.Method) {
 	s.cellbuf.Method = method
 	s.scr.SetGraphemeWidth(method == ansi.GraphemeWidth)
 	s.scr.SetWidthMethod(method)
-	s.pendingUpdate = true
+	s.forceFlush = true
 	s.mu.Unlock()
 }
 
