@@ -786,6 +786,24 @@ func (s *cursedRenderer) insertAboveLocked(str string, output io.Writer) error {
 		}
 	}
 
+	// Insertion leaves the terminal at the live frame's origin. Restore the
+	// displayed cursor even if the next flush skips an unchanged view. Use
+	// lastView, not view: an immediate insert can precede a pending redraw.
+	if s.lastView != nil && s.lastView.Cursor != nil {
+		cur := s.lastView.Cursor
+		var restore strings.Builder
+		if cur.Y > 0 {
+			restore.WriteString(ansi.CursorDown(cur.Y))
+		}
+		if cur.X > 0 {
+			restore.WriteString(ansi.CursorForward(cur.X))
+		}
+		if _, err := io.WriteString(output, restore.String()); err != nil {
+			return fmt.Errorf("bubbletea: error restoring cursor after insert above: %w", err)
+		}
+		s.scr.SetPosition(cur.X, cur.Y)
+	}
+
 	return nil
 }
 

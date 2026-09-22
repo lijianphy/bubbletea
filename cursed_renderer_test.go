@@ -83,6 +83,68 @@ func TestCursedRenderer_mouseVsFlush(t *testing.T) {
 	}
 }
 
+func TestCursedRenderer_insertAboveRestoresDisplayedCursor(t *testing.T) {
+	t.Parallel()
+
+	for _, afterRender := range []bool{false, true} {
+		for _, chunked := range []bool{false, true} {
+			for _, syncd := range []bool{false, true} {
+				t.Run(fmt.Sprintf("afterRender=%t/chunked=%t/syncd=%t", afterRender, chunked, syncd), func(t *testing.T) {
+					var out bytes.Buffer
+					renderer := newCursedRenderer(&out, []string{"TERM=xterm-256color"}, 40, 10)
+					renderer.syncdUpdates = syncd
+					displayed := NewView("Working\n\n\n> input\n\nfooter")
+					displayed.Cursor = NewCursor(7, 3)
+					renderer.render(displayed)
+					if err := renderer.flush(false); err != nil {
+						t.Fatal(err)
+					}
+
+					pending := NewView("\n> input\n\nfooter")
+					pending.Cursor = NewCursor(4, 1)
+					renderer.render(pending)
+					out.Reset()
+					payload := "committed scrollback"
+					if chunked {
+						payload = strings.Repeat("committed scrollback\n", 30)
+					}
+					want := displayed.Cursor
+					var err error
+					if afterRender {
+						want = pending.Cursor
+						err = renderer.insertAboveAfterRender(payload)
+					} else {
+						err = renderer.insertAbove(payload)
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					x, y := renderer.scr.Position()
+					if x != want.X || y != want.Y {
+						t.Fatalf("cursor = (%d,%d), want (%d,%d)", x, y, want.X, want.Y)
+					}
+					raw := strings.TrimSuffix(out.String(), ansi.ResetModeSynchronizedOutput)
+					restore := ansi.CursorDown(want.Y) + ansi.CursorForward(want.X)
+					if !strings.HasSuffix(raw, restore) {
+						t.Fatalf("output missing cursor restoration %q: %q", restore, raw)
+					}
+					// An unchanged view must not need another redraw to repair
+					// the physical cursor position.
+					if afterRender {
+						out.Reset()
+						if err := renderer.flush(false); err != nil {
+							t.Fatal(err)
+						}
+						if out.Len() != 0 {
+							t.Fatalf("unchanged view redrew: %q", out.String())
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestCursedRenderer_insertAboveAfterRenderFlushesPendingFrame(t *testing.T) {
 	t.Parallel()
 
